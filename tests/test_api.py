@@ -246,6 +246,24 @@ def test_reconcile_decimal_precision_is_exact():
     assert [format(s.end, "f") for s in timeline] == ["0.1", "0.3", "0.6"]
 
 
+def test_reconcile_deep_fractional_duration_beyond_default_context_is_exact():
+    # Regression: a 40-significant-digit EXTINF duration was rounded by the
+    # default 28-digit decimal context while accumulating the timeline.
+    deep = "0.1234567890123456789012345678901234567890"
+    text = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        f"#EXTINF:{deep},", "a.ts",
+        f"#EXTINF:{deep},", "a.ts",
+    ])
+    timeline = reconcile(BASE_URL, [text])
+    assert format(timeline[0].end, "f") == deep
+    assert format(timeline[1].start, "f") == deep
+    assert format(timeline[1].end, "f") == (
+        "0.2469135780246913578024691357802469135780"
+    )
+
+
 # ------------------------------------------------------------------- locate
 
 def test_parse_program_time_normalizes_offsets_to_utc():
@@ -272,6 +290,43 @@ def test_format_program_time_roundtrip():
     assert format_program_time(parse_program_time(raw)) == "2024-01-02T03:04:05.5Z"
     # Pre-epoch negative timestamp keeps its fraction.
     assert format_program_time(Decimal("-0.5")) == "1969-12-31T23:59:59.5Z"
+
+
+def test_parse_program_time_deep_fraction_beyond_default_context_is_exact():
+    # Regression: the whole-second epoch base (10 digits) plus an 18-digit
+    # fraction is 29 significant digits, which the default 28-digit decimal
+    # context rounded away — two distinct anchors collapsed onto one instant.
+    first = parse_program_time("2024-01-01T00:00:00.0000000000000000001Z")
+    second = parse_program_time("2024-01-01T00:00:00.0000000000000000002Z")
+    assert first != second
+    assert second - first == Decimal("1E-19")
+    assert format(first, "f") == "1704067200.0000000000000000001"
+    assert format_program_time(first) == (
+        "2024-01-01T00:00:00.0000000000000000001Z"
+    )
+    assert format_program_time(second) == (
+        "2024-01-01T00:00:00.0000000000000000002Z"
+    )
+
+
+def test_locate_deep_fraction_anchor_keeps_exact_offset():
+    # Regression: anchor + 10s duration used to round the 1e-19 fraction off,
+    # and target - start produced a distorted in-segment offset.
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    pl = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\nseg0.ts\n"
+    )
+    found = locate(
+        BASE_URL,
+        [pl, pl],
+        "2024-01-01T00:00:05.0000000000000000007Z",
+    )
+    assert format_program_time(found.start_at) == anchor
+    assert format_program_time(found.end_at) == (
+        "2024-01-01T00:00:10.0000000000000000001Z"
+    )
+    assert format(found.offset, "f") == "5.0000000000000000006"
 
 
 def _anchored_playlist():
@@ -809,6 +864,27 @@ def test_api_vod_resolves_relative_uris_against_playlist_url():
     playlist = resp.json()["playlist"]
     assert "https://cdn.example.com/live/v/x.ts\n" in playlist
     assert "https://cdn.example.com/live/idx/y.ts\n" in playlist
+
+
+def test_api_vod_deep_fraction_window_keeps_exact_surplus():
+    # Regression: clipping and head/tail surplus must not round deep decimals.
+    deep = "0.1234567890123456789012345678901234567890"
+    pl = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        f"#EXTINF:{deep},", "a0.ts",
+        f"#EXTINF:{deep},", "a1.ts",
+    ]) + "\n"
+    resp = vod_post(
+        [pl, pl],
+        "0.0000000000000000000000000000000000000001",
+        deep,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["head_extra_sec"] == "0.0000000000000000000000000000000000000001"
+    assert body["tail_extra_sec"] == "0"
+    assert f"#EXTINF:{deep}," in body["playlist"]
 
 
 def test_api_vod_accepts_numeric_bounds():
@@ -1737,6 +1813,131 @@ def test_api_switch_plan_rejects_invalid_request_shapes():
     # Only one snapshot for the primary.
     resp = switch_post(URL_A, [snap], URL_B, [snap, snap])
     assert resp.status_code == 422
+
+
+def test_api_switch_plan_deep_fraction_anchor_conflict_is_422_without_plan():
+    # Regression: the primary snapshots agree on sequence, URI and the 10s
+    # duration; only the PDT anchors differ by 1e-19s. The default 28-digit
+    # decimal context rounded both onto the same instant and a plan was
+    # returned; the anchors must instead be detected as a conflict.
+    snapshot_0 = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PROGRAM-DATE-TIME:"
+        "2024-01-01T00:00:00.0000000000000000001Z\n"
+        "#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n"
+    )
+    snapshot_1 = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PROGRAM-DATE-TIME:"
+        "2024-01-01T00:00:00.0000000000000000002Z\n"
+        "#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n"
+    )
+    backup = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n"
+        "#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+    )
+    resp = switch_post(
+        URL_A, [snapshot_0, snapshot_1],
+        URL_B, [backup, backup],
+        start="2024-01-01T00:00:01Z",
+        end="2024-01-01T00:00:02Z",
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "program_time_conflict"
+    assert body["stream"] == "a"
+    assert body["snapshot_index"] == 1
+    assert body["sequence"] == 0
+    # No plan is returned on conflict.
+    assert "intervals" not in body
+
+
+def test_api_switch_plan_deep_fraction_keeps_exact_times_and_offsets():
+    # Legal deep-fraction input must stay exact through UTC parsing, anchor
+    # extrapolation, window clipping and in-segment offset computation.
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    primary = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n"
+        "#EXTINF:10,\nhttps://a.example.com/live/a0.ts\n"
+    )
+    backup = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n"
+        "#EXTINF:10,\nhttps://b.example.com/live/b0.ts\n"
+    )
+    start = "2024-01-01T00:00:01.0000000000000000001Z"
+    end = "2024-01-01T00:00:02.0000000000000000001Z"
+    resp = switch_post(
+        URL_A, [primary, primary], URL_B, [backup, backup],
+        start=start, end=end,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["start_at"] == start
+    assert body["end_at"] == end
+    assert body["intervals"] == [
+        {
+            "source": "a",
+            "sequence": 0,
+            "uri": "https://a.example.com/live/a0.ts",
+            "start_at": start,
+            "end_at": end,
+            "offset_start": "1.0000000000000000000",
+            "offset_end": "2.0000000000000000000",
+        }
+    ]
+
+
+def test_api_switch_plan_adjacent_deep_fraction_bounds_are_not_equal():
+    # Adjacent legal bounds differing only at the 19th fractional digit must
+    # not be judged equal by rounding; identical bounds are still rejected.
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    primary = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+        "https://a.example.com/live/a0.ts\n"
+    )
+    backup = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+        "https://b.example.com/live/b0.ts\n"
+    )
+    distinct = switch_post(
+        URL_A, [primary, primary], URL_B, [backup, backup],
+        start="2024-01-01T00:00:01.0000000000000000001Z",
+        end="2024-01-01T00:00:01.0000000000000000002Z",
+    )
+    assert distinct.status_code == 200, distinct.text
+
+    equal = switch_post(
+        URL_A, [primary, primary], URL_B, [backup, backup],
+        start="2024-01-01T00:00:01.0000000000000000001Z",
+        end="2024-01-01T00:00:01.0000000000000000001Z",
+    )
+    assert equal.status_code == 422
+
+
+def test_api_intersect_deep_fraction_offsets_are_exact():
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    snap_a = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+        "https://a.example.com/live/a0.ts\n"
+    )
+    snap_b = (
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n#EXTINF:10,\n"
+        "https://b.example.com/live/b0.ts\n"
+    )
+    resp = intersect_post(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b])
+    assert resp.status_code == 200, resp.text
+    interval = resp.json()["intervals"][0]
+    assert interval["start_at"] == anchor
+    assert interval["end_at"] == "2024-01-01T00:00:10.0000000000000000001Z"
+    assert interval["offset_a"] == "0"
+    assert interval["offset_b"] == "0"
 
 
 def test_api_old_endpoints_still_available_after_switch_plan():

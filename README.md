@@ -177,6 +177,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    同一区间），而**不是按断点计数值查表**。
 2. **归一为 UTC**：标签和 `target_at` 的时区偏移先归一到 UTC。内部一律用
    `Decimal` 精确十进制 POSIX 秒表示，小数秒按原样保留精度，全程不经过二进制浮点。
+   时间链路上的每一次加减（UTC 解析、锚点推时、窗口裁剪、片内偏移）都在按
+   操作数位数动态放宽精度的十进制上下文中执行，**不依赖默认 28 位有效数字**：
+   像 `2024-01-01T00:00:00.0000000000000000001Z`（10 位整数秒 + 18 位小数 =
+   29 位）这样的时刻也逐位保留，两个仅在第 19 位小数上不同的相邻合法时刻绝不会
+   因舍入被判为相等；支持的小数位数不设上限，`EXTINF` 时长同理。
 3. **仅在同一连续序号区间内推算**：从锚点出发，按各片段 `EXTINF` 的精确十进制
    时长，向序号增大/减小两个方向逐段累加/累减，得到区间内每段的 UTC 起止时间。
    **绝不跨越 `#EXT-X-DISCONTINUITY` 断点推算**：无锚点的区间没有任何已知时间覆盖。
@@ -458,6 +463,47 @@ curl -s http://localhost:8000/v1/switch-plan \
   }'
 ```
 
+### 极小小数锚点的冲突必须检出（回归示例）
+
+主路两份快照的序号、URI、`EXTINF:10` 完全相同，仅同序号锚点在第 19 位小数上
+相差 `1e-19` 秒。这两个锚点必须被判定为 `program_time_conflict`——即使差值远
+小于默认十进制上下文的 28 位有效数字，也不能被舍入成同一时刻而漏检：
+
+```bash
+curl -s http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.0000000000000000001Z\n#EXTINF:10,\na0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.0000000000000000002Z\n#EXTINF:10,\na0.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n"
+      ]
+    },
+    "start_at": "2024-01-01T00:00:01Z",
+    "end_at": "2024-01-01T00:00:02Z"
+  }'
+```
+
+返回 `422`（不返回任何计划），并保留出错来源、快照下标与序号：
+
+```json
+{
+  "error": "program_time_conflict",
+  "detail": "snapshot 1 program-date-time at sequence 0 disagrees with the anchor at snapshot 0 for the same sequence after UTC normalization",
+  "stream": "a",
+  "snapshot_index": 1,
+  "sequence": 0
+}
+```
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间
@@ -635,6 +681,7 @@ curl -s http://localhost:8000/v1/reconcile \
 
 ```
 app/
+  exactdecimal.py # 与操作数位数无关的精确 Decimal 加减/小数构造（时间链路共用）
   hls.py         # 离线清单解析（序号 / 时长 / 断点 / 字节范围 / URI / PDT 锚点）
   reconcile.py   # 跨快照合并、连续性与一致性校验、时间轴计算、禁用标签检查
   locate.py      # PDT 精确 UTC 解析/推算、锚点一致性校验、半开区间定位

@@ -256,6 +256,23 @@ def _error(code: str, detail: str, status: int = 422, **extra) -> JSONResponse:
     return JSONResponse(status_code=status, content=body)
 
 
+def _format_seconds(value: Decimal) -> str:
+    """Format an exact decimal duration/offset for output.
+
+    Non-zero values keep every significant digit (deep fractions are never
+    rounded). A zero produced by exact subtraction may carry a deep
+    coefficient exponent (``0E-40``), which would render with 40 trailing
+    zeros; such an exact zero is rendered as ``"0"`` (``0``/``0.00`` operands
+    keep their existing short forms).
+    """
+
+    if value == 0 and value.as_tuple().exponent <= -4:
+        # A deep zero (e.g. 0E-19 from 1.0...1 - 1.0...1) renders as a run of
+        # trailing zeros; shallow zeros like 0.00 keep their existing form.
+        return "0"
+    return format(value, "f")
+
+
 @app.exception_handler(LocateError)
 async def locate_error_handler(_request: Request, exc: LocateError) -> JSONResponse:
     return _error(
@@ -339,12 +356,12 @@ async def reconcile_endpoint(payload: ReconcileRequest) -> ReconcileResponse:
         SegmentOut(
             sequence=seg.sequence,
             uri=seg.uri,
-            duration=format(seg.duration, "f"),
+            duration=_format_seconds(seg.duration),
             discontinuity=seg.discontinuity,
             byte_offset=seg.byte_offset,
             byte_length=seg.byte_length,
-            start=format(seg.start, "f"),
-            end=format(seg.end, "f"),
+            start=_format_seconds(seg.start),
+            end=_format_seconds(seg.end),
         )
         for seg in timeline
     ]
@@ -352,7 +369,7 @@ async def reconcile_endpoint(payload: ReconcileRequest) -> ReconcileResponse:
     return ReconcileResponse(
         playlist_url=payload.playlist_url,
         count=len(segments),
-        duration=format(total, "f"),
+        duration=_format_seconds(total),
         segments=segments,
     )
 
@@ -365,7 +382,7 @@ async def locate_endpoint(payload: LocateRequest) -> LocateResponse:
         uri=found.uri,
         start_at=format_program_time(found.start_at),
         end_at=format_program_time(found.end_at),
-        offset=format(found.offset, "f"),
+        offset=_format_seconds(found.offset),
     )
 
 
@@ -379,12 +396,12 @@ async def vod_endpoint(payload: VodRequest) -> VodResponse:
     )
     return VodResponse(
         playlist_url=payload.playlist_url,
-        from_sec=format(window.from_sec, "f"),
-        to_sec=format(window.to_sec, "f"),
-        covered_start=format(window.covered_start, "f"),
-        covered_end=format(window.covered_end, "f"),
-        head_extra_sec=format(window.head_extra, "f"),
-        tail_extra_sec=format(window.tail_extra, "f"),
+        from_sec=_format_seconds(window.from_sec),
+        to_sec=_format_seconds(window.to_sec),
+        covered_start=_format_seconds(window.covered_start),
+        covered_end=_format_seconds(window.covered_end),
+        head_extra_sec=_format_seconds(window.head_extra),
+        tail_extra_sec=_format_seconds(window.tail_extra),
         segment_count=window.segment_count,
         playlist=window.playlist,
     )
@@ -426,8 +443,8 @@ async def intersect_endpoint(payload: IntersectRequest) -> IntersectResponse:
                 sequence_b=item.sequence_b,
                 start_at=format_program_time(item.start_at),
                 end_at=format_program_time(item.end_at),
-                offset_a=format(item.offset_a, "f"),
-                offset_b=format(item.offset_b, "f"),
+                offset_a=_format_seconds(item.offset_a),
+                offset_b=_format_seconds(item.offset_b),
             )
             for item in intervals
         ]
@@ -456,8 +473,8 @@ async def switch_plan_endpoint(payload: SwitchPlanRequest) -> SwitchPlanResponse
                 uri=item.uri,
                 start_at=format_program_time(item.start_at),
                 end_at=format_program_time(item.end_at),
-                offset_start=format(item.offset_start, "f"),
-                offset_end=format(item.offset_end, "f"),
+                offset_start=_format_seconds(item.offset_start),
+                offset_end=_format_seconds(item.offset_end),
             )
             for item in intervals
         ],

@@ -25,9 +25,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal
 from typing import Iterable, Optional
 
+from .exactdecimal import decimal_fraction, exact_add, exact_sub
 from .hls import PlaylistParseError, Segment, parse_playlist
 from .reconcile import ReconcileError, reconcile
 
@@ -93,18 +94,45 @@ def parse_program_time(raw: str) -> Decimal:
 
     days = (moment.date() - _EPOCH).days
     seconds_in_day = moment.hour * 3600 + moment.minute * 60 + moment.second
-    fraction_value = Decimal(f"0.{fraction}") if fraction else Decimal(0)
 
-    # Local wall time minus its offset is the UTC instant.
-    return Decimal(days * 86400 + seconds_in_day - offset_seconds) + fraction_value
+    # Local wall time minus its offset is the UTC instant. The whole-second
+    # count and the sub-second fraction are combined with context-independent
+    # exact arithmetic: the default 28-digit context would round deep fractions
+    # off a 10-digit epoch base (e.g. 19-digit fractions after 2024-01-01).
+    whole_seconds = Decimal(days * 86400 + seconds_in_day - offset_seconds)
+    return exact_add(whole_seconds, decimal_fraction(fraction or ""))
+
+
+def _floor_to_second(timestamp: Decimal) -> tuple[int, Decimal]:
+    """Split ``timestamp`` into ``(floor_seconds, fraction)`` exactly.
+
+    Works on the decimal coefficient directly so no decimal-context precision
+    (default 28 significant digits) can round deep fractions of large epoch
+    bases before the split. The fraction always satisfies ``0 <= frac < 1``,
+    including for negative (pre-epoch) timestamps.
+    """
+
+    sign, digits, exponent = timestamp.as_tuple()
+    if exponent >= 0:
+        return int(timestamp), Decimal(0)
+
+    coefficient = int("".join(str(d) for d in digits)) if digits else 0
+    scale = 10**-exponent
+    toward_zero, remainder = divmod(coefficient, scale)
+    if sign and remainder:
+        # Negative non-integer: floor is one below truncation toward zero and
+        # the fractional part is measured up from that lower whole second.
+        numerator = scale - remainder
+        fraction = decimal_fraction(f"{numerator:0{-exponent}d}")
+        return -toward_zero - 1, fraction
+    fraction = decimal_fraction(f"{remainder:0{-exponent}d}")
+    return -toward_zero if sign else toward_zero, fraction
 
 
 def format_program_time(timestamp: Decimal) -> str:
     """Format an exact UTC POSIX timestamp as ``YYYY-MM-DDTHH:MM:SS[.frac]Z``."""
 
-    # Floor toward -infinity so any negative timestamp keeps 0 <= frac < 1.
-    total_seconds = int(timestamp.to_integral_value(rounding=ROUND_FLOOR))
-    fraction = timestamp - Decimal(total_seconds)
+    total_seconds, fraction = _floor_to_second(timestamp)
     days, seconds_of_day = divmod(total_seconds, 86400)
     day = _EPOCH + timedelta(days=days)
     hours, remainder = divmod(seconds_of_day, 3600)
@@ -234,7 +262,7 @@ def _build_intervals(timeline) -> list[_Interval]:
         cursor = Decimal("0")
         for seg in interval.segments:
             interval.prefix[seg.sequence] = cursor
-            cursor += seg.duration
+            cursor = exact_add(cursor, seg.duration)
 
     return intervals
 
@@ -308,10 +336,12 @@ def _resolve_intervals(
                 first = anchor
                 continue
 
-            expected = (
-                first.utc_start
-                + interval.prefix[anchor.sequence]
-                - interval.prefix[first.sequence]
+            expected = exact_add(
+                first.utc_start,
+                exact_sub(
+                    interval.prefix[anchor.sequence],
+                    interval.prefix[first.sequence],
+                ),
             )
             if anchor.utc_start != expected:
                 raise LocateError(
@@ -333,8 +363,9 @@ def _resolve_intervals(
         anchor = min(interval.anchors, key=lambda item: item.sequence)
         anchor_offset = interval.prefix[anchor.sequence]
         for seg in interval.segments:
-            interval.utc_starts[seg.sequence] = (
-                anchor.utc_start + interval.prefix[seg.sequence] - anchor_offset
+            interval.utc_starts[seg.sequence] = exact_add(
+                anchor.utc_start,
+                exact_sub(interval.prefix[seg.sequence], anchor_offset),
             )
 
     return intervals
@@ -363,7 +394,7 @@ def anchored_segments(
                     sequence=seg.sequence,
                     uri=seg.uri,
                     start_at=utc_start,
-                    end_at=utc_start + seg.duration,
+                    end_at=exact_add(utc_start, seg.duration),
                     run_index=run_index,
                 )
             )
@@ -396,7 +427,7 @@ def locate(
             utc_start = interval.utc_starts.get(seg.sequence)
             if utc_start is None:
                 continue
-            utc_end = utc_start + seg.duration
+            utc_end = exact_add(utc_start, seg.duration)
             if utc_start <= target < utc_end:
                 hits.append(
                     TimedSegment(
@@ -436,5 +467,5 @@ def locate(
         uri=hit.uri,
         start_at=hit.start_at,
         end_at=hit.end_at,
-        offset=target - hit.start_at,
+        offset=exact_sub(target, hit.start_at),
     )

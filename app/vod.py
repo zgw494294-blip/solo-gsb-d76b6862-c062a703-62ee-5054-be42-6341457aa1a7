@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from typing import Iterable, Optional, Sequence
 
+from .exactdecimal import exact_context, exact_sub
 from .reconcile import (
     ReconcileError,
     ReconciledSegment,
@@ -67,7 +68,8 @@ def render_vod_playlist(segments: Sequence[ReconciledSegment]) -> str:
         "#EXT-X-PLAYLIST-TYPE:VOD",
     ]
     longest = max(seg.duration for seg in segments)
-    target = int(longest.to_integral_value(rounding=ROUND_CEILING))
+    with exact_context([longest]):
+        target = int(longest.to_integral_value(rounding=ROUND_CEILING))
     lines.append(f"#EXT-X-TARGETDURATION:{target}")
 
     previous_discontinuity: Optional[int] = None
@@ -138,8 +140,8 @@ def export_vod(
         to_sec=to_sec,
         covered_start=first.start,
         covered_end=last.end,
-        head_extra=from_sec - first.start,
-        tail_extra=last.end - to_sec,
+        head_extra=exact_sub(from_sec, first.start),
+        tail_extra=exact_sub(last.end, to_sec),
         segment_count=len(selected),
         playlist=render_vod_playlist(selected),
     )

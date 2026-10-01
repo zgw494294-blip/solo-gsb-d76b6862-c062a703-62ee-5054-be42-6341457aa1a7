@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable, Optional, Sequence
 
+from .exactdecimal import exact_add
 from .hls import PlaylistParseError, Segment, parse_playlist
 
 
@@ -174,7 +175,7 @@ def reconcile(playlist_url: str, snapshots: Iterable[str]) -> list[ReconciledSeg
                 sequence=sequence,
             )
         start = cursor
-        cursor += seg.duration
+        cursor = exact_add(cursor, seg.duration)
         timeline.append(
             ReconciledSegment(
                 sequence=seg.sequence,
