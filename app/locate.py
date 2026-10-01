@@ -30,6 +30,7 @@ from typing import Iterable, Optional
 
 from .hls import PlaylistParseError, Segment, parse_playlist
 from .reconcile import ReconcileError, reconcile
+from .timeutil import exact_add, exact_sub
 
 _EPOCH = date(1970, 1, 1)
 
@@ -95,16 +96,23 @@ def parse_program_time(raw: str) -> Decimal:
     seconds_in_day = moment.hour * 3600 + moment.minute * 60 + moment.second
     fraction_value = Decimal(f"0.{fraction}") if fraction else Decimal(0)
 
-    # Local wall time minus its offset is the UTC instant.
-    return Decimal(days * 86400 + seconds_in_day - offset_seconds) + fraction_value
+    # Local wall time minus its offset is the UTC instant. The whole-second
+    # part is an integer and the fraction is an exact literal, but the sum is
+    # still routed through exact_add so a sub-nanosecond fraction is never
+    # rounded off under the default 28-digit context.
+    return exact_add(
+        Decimal(days * 86400 + seconds_in_day - offset_seconds), fraction_value
+    )
 
 
 def format_program_time(timestamp: Decimal) -> str:
     """Format an exact UTC POSIX timestamp as ``YYYY-MM-DDTHH:MM:SS[.frac]Z``."""
 
     # Floor toward -infinity so any negative timestamp keeps 0 <= frac < 1.
+    # to_integral_value only rounds to the unit and is independent of the
+    # Decimal context precision, so every input digit survives.
     total_seconds = int(timestamp.to_integral_value(rounding=ROUND_FLOOR))
-    fraction = timestamp - Decimal(total_seconds)
+    fraction = exact_sub(timestamp, Decimal(total_seconds))
     days, seconds_of_day = divmod(total_seconds, 86400)
     day = _EPOCH + timedelta(days=days)
     hours, remainder = divmod(seconds_of_day, 3600)
@@ -234,7 +242,7 @@ def _build_intervals(timeline) -> list[_Interval]:
         cursor = Decimal("0")
         for seg in interval.segments:
             interval.prefix[seg.sequence] = cursor
-            cursor += seg.duration
+            cursor = exact_add(cursor, seg.duration)
 
     return intervals
 
@@ -308,10 +316,11 @@ def _resolve_intervals(
                 first = anchor
                 continue
 
-            expected = (
-                first.utc_start
-                + interval.prefix[anchor.sequence]
-                - interval.prefix[first.sequence]
+            expected = exact_sub(
+                exact_add(
+                    first.utc_start, interval.prefix[anchor.sequence]
+                ),
+                interval.prefix[first.sequence],
             )
             if anchor.utc_start != expected:
                 raise LocateError(
@@ -333,8 +342,9 @@ def _resolve_intervals(
         anchor = min(interval.anchors, key=lambda item: item.sequence)
         anchor_offset = interval.prefix[anchor.sequence]
         for seg in interval.segments:
-            interval.utc_starts[seg.sequence] = (
-                anchor.utc_start + interval.prefix[seg.sequence] - anchor_offset
+            interval.utc_starts[seg.sequence] = exact_sub(
+                exact_add(anchor.utc_start, interval.prefix[seg.sequence]),
+                anchor_offset,
             )
 
     return intervals
@@ -363,7 +373,7 @@ def anchored_segments(
                     sequence=seg.sequence,
                     uri=seg.uri,
                     start_at=utc_start,
-                    end_at=utc_start + seg.duration,
+                    end_at=exact_add(utc_start, seg.duration),
                     run_index=run_index,
                 )
             )
@@ -396,7 +406,7 @@ def locate(
             utc_start = interval.utc_starts.get(seg.sequence)
             if utc_start is None:
                 continue
-            utc_end = utc_start + seg.duration
+            utc_end = exact_add(utc_start, seg.duration)
             if utc_start <= target < utc_end:
                 hits.append(
                     TimedSegment(
@@ -436,5 +446,5 @@ def locate(
         uri=hit.uri,
         start_at=hit.start_at,
         end_at=hit.end_at,
-        offset=target - hit.start_at,
+        offset=exact_sub(target, hit.start_at),
     )

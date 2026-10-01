@@ -28,6 +28,7 @@ from typing import Iterable, Optional
 
 from .locate import LocateError, TimedSegment, anchored_segments
 from .reconcile import ReconcileError
+from .timeutil import exact_sub
 
 
 class IntersectError(ReconcileError):
@@ -157,8 +158,8 @@ def _intersect(
                     sequence_b=seg_b.sequence,
                     start_at=start,
                     end_at=end,
-                    offset_a=start - seg_a.start_at,
-                    offset_b=start - seg_b.start_at,
+                    offset_a=exact_sub(start, seg_a.start_at),
+                    offset_b=exact_sub(start, seg_b.start_at),
                 )
             )
 

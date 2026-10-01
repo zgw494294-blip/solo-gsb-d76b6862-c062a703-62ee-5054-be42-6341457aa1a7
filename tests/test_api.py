@@ -246,6 +246,24 @@ def test_reconcile_decimal_precision_is_exact():
     assert [format(s.end, "f") for s in timeline] == ["0.1", "0.3", "0.6"]
 
 
+def test_reconcile_durations_beyond_28_significant_digits_are_exact():
+    # A 20-significant-digit duration repeated twice reaches 21 digits; under
+    # the default 28-digit context this still fits, but adding three reaches
+    # 22 — the point of the test is that the timeline never rounds regardless
+    # of how many significant digits the accumulated seconds span.
+    text = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:12345678901234567890,", "a.ts",
+        "#EXTINF:12345678901234567890,", "a.ts",
+        "#EXTINF:0.0000000000000000001,", "a.ts",
+    ])
+    timeline = reconcile(BASE_URL, [text])
+    assert format(timeline[0].end, "f") == "12345678901234567890"
+    assert format(timeline[1].end, "f") == "24691357802469135780"
+    assert format(timeline[2].end, "f") == "24691357802469135780.0000000000000000001"
+
+
 # ------------------------------------------------------------------- locate
 
 def test_parse_program_time_normalizes_offsets_to_utc():
@@ -265,6 +283,26 @@ def test_parse_program_time_keeps_exact_decimal_fraction():
         parse_program_time("2024-01-02T03:04:05")  # naive, no offset
     with pytest.raises(PlaylistParseError):
         parse_program_time("2024-01-02 03:04:05Z")  # missing T separator
+
+
+def test_parse_program_time_keeps_sub_nanosecond_fraction_exact():
+    # The default Decimal context carries only 28 significant digits; the
+    # 10-digit epoch second plus this 19-digit fraction needs 29, so a naive
+    # "+" would round both anchors down to the whole second and they would
+    # wrongly compare equal.
+    one = parse_program_time("2024-01-01T00:00:00.0000000000000000001Z")
+    two = parse_program_time("2024-01-01T00:00:00.0000000000000000002Z")
+    assert format(one, "f") == "1704067200.0000000000000000001"
+    assert format(two, "f") == "1704067200.0000000000000000002"
+    assert one != two
+    assert one < two
+    # Timezone normalization keeps the fraction bit-for-bit.
+    assert parse_program_time(
+        "2024-01-01T08:00:00.0000000000000000001+08:00"
+    ) == one
+    assert format_program_time(one) == (
+        "2024-01-01T00:00:00.0000000000000000001Z"
+    )
 
 
 def test_format_program_time_roundtrip():
@@ -375,6 +413,52 @@ def test_locate_cross_snapshot_anchor_agrees_after_utc_normalization():
     s1 = m3u(1, media_sequence=0, pdt_before={0: "2024-01-02T03:04:05+08:00"})
     found = locate(BASE_URL, [s0, s1], "2024-01-01T19:04:05.5Z")
     assert found.sequence == 0
+
+
+def test_locate_sub_nanosecond_anchor_conflict_is_not_rounded_away():
+    # Two snapshots, same sequence/URI/duration, anchors differing by only
+    # 1e-19 s: rounding to 28 significant digits made them equal and the
+    # conflict was missed. It must be reported with snapshot index/sequence.
+    s0 = m3u(1, media_sequence=0, durations=["10"],
+             pdt_before={0: "2024-01-01T00:00:00.0000000000000000001Z"},
+             uris=["seg0.ts"])
+    s1 = m3u(1, media_sequence=0, durations=["10"],
+             pdt_before={0: "2024-01-01T00:00:00.0000000000000000002Z"},
+             uris=["seg0.ts"])
+    with pytest.raises(LocateError) as exc:
+        locate(BASE_URL, [s0, s1], "2024-01-01T00:00:01Z")
+    assert exc.value.code == "program_time_conflict"
+    assert exc.value.snapshot_index == 1
+    assert exc.value.sequence == 0
+
+
+def test_locate_sub_nanosecond_offset_and_extrapolation_are_exact():
+    nanodur = "0.000000000000000001"  # 1e-18 s per segment
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    s0 = m3u(3, media_sequence=0, durations=[nanodur] * 3,
+             pdt_before={0: anchor},
+             uris=["seg0.ts", "seg1.ts", "seg2.ts"])
+    s1 = m3u(3, media_sequence=2, durations=[nanodur] * 3,
+             uris=["seg2.ts", "seg3.ts", "seg4.ts"])
+    # seq0 [..0001,..0011) seq1 [..0011,..0021) seq2 [..0021,..0031); the
+    # second snapshot starts at seq2, so its starts are reached by forward
+    # extrapolation that must carry the 19-digit fraction exactly. Target
+    # ..0025 lands in seq2 with in-segment offset 4e-19.
+    found = locate(BASE_URL, [s0, s1],
+                   "2024-01-01T00:00:00.0000000000000000025Z")
+    assert found.sequence == 2
+    assert format_program_time(found.start_at) == (
+        "2024-01-01T00:00:00.0000000000000000021Z"
+    )
+    assert format_program_time(found.end_at) == (
+        "2024-01-01T00:00:00.0000000000000000031Z"
+    )
+    assert format(found.offset, "f") == "0.0000000000000000004"
+    # Half-open boundary: the ..0021 instant belongs to seq2, not seq1.
+    edge = locate(BASE_URL, [s0, s1],
+                  "2024-01-01T00:00:00.0000000000000000021Z")
+    assert edge.sequence == 2
+    assert format(edge.offset, "f") == "0.0000000000000000000"
 
 
 def test_locate_multiple_anchors_in_region_must_match_extrapolation():
@@ -741,6 +825,29 @@ def test_api_vod_full_window_has_zero_extra():
     assert body["covered_end"] == "4.40"
     assert body["head_extra_sec"] == "0"
     assert body["tail_extra_sec"] == "0.00"
+
+
+def test_api_vod_extra_seconds_keep_sub_nanosecond_precision():
+    # The window starts 1e-19 s into the second segment; the surplus carried
+    # at the head must keep the 19-digit fraction rather than round to a
+    # whole second.
+    text = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:10,", "a.ts",
+        "#EXTINF:10,", "b.ts",
+    ]) + "\n"
+    resp = vod_post(
+        [text, text],
+        "10.0000000000000000001",
+        "20",
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["covered_start"] == "10"
+    assert body["covered_end"] == "20"
+    assert body["head_extra_sec"] == "0.0000000000000000001"
+    assert body["tail_extra_sec"] == "0"
 
 
 def test_api_vod_targetduration_ceils_longest_and_extinf_keeps_precision():
@@ -1121,6 +1228,33 @@ def test_intersect_exact_decimal_offsets():
     assert format_program_time(item.end_at) == "2024-01-01T19:04:02Z"
     assert format(item.offset_a, "f") == "1.25"
     assert format(item.offset_b, "f") == "0.00"
+
+
+def test_intersect_sub_nanosecond_offsets_are_exact():
+    # A starts at ..0001 with a 1e-18 s segment; B starts at the whole
+    # second. The common range is [..0001, ..0011); offsets must keep the
+    # 19-digit fraction rather than collapsing to 0 / a whole second.
+    ua, sa = _plain_stream(
+        URL_A, 0, ["0.000000000000000001"],
+        anchor="2024-01-01T00:00:00.0000000000000000001Z",
+        uris=["a0.ts"],
+    )
+    ub, sb = _plain_stream(
+        URL_B, 10, ["0.000000000000000001"],
+        anchor="2024-01-01T00:00:00Z",
+        uris=["b10.ts"],
+    )
+    result = intersect_streams(ua, sa, ub, sb)
+    assert len(result) == 1
+    item = result[0]
+    assert format_program_time(item.start_at) == (
+        "2024-01-01T00:00:00.0000000000000000001Z"
+    )
+    assert format_program_time(item.end_at) == (
+        "2024-01-01T00:00:00.000000000000000001Z"
+    )
+    assert format(item.offset_a, "f") == "0.0000000000000000000"
+    assert format(item.offset_b, "f") == "0.0000000000000000001"
 
 
 def test_intersect_zero_length_touch_is_not_output():
@@ -1598,6 +1732,66 @@ def test_switch_plan_anchor_conflict_tagged_with_stream():
     assert exc.value.snapshot_index == 1
 
 
+def test_switch_plan_sub_nanosecond_anchor_conflict_is_detected():
+    # Same sequence, URI and 10-second duration in both primary snapshots;
+    # only the anchors differ (by 1e-19 s). Rounding to the 28-digit Decimal
+    # context used to equate them and return a plan instead of 422.
+    good = m3u(1, media_sequence=0, durations=["10"],
+               pdt_before={0: "2024-01-01T00:00:00.0000000000000000001Z"},
+               uris=["a0.ts"])
+    bad = m3u(1, media_sequence=0, durations=["10"],
+              pdt_before={0: "2024-01-01T00:00:00.0000000000000000002Z"},
+              uris=["a0.ts"])
+    ub, sb = _plain_stream(URL_B, 0, ["10"], anchor="2024-01-01T00:00:00Z",
+                           uris=["b0.ts"])
+    with pytest.raises(SwitchError) as exc:
+        _plan(URL_A, [good, bad], ub, sb,
+              start="2024-01-01T00:00:01Z",
+              end="2024-01-01T00:00:02Z")
+    assert exc.value.code == "program_time_conflict"
+    assert exc.value.stream == "a"
+    assert exc.value.snapshot_index == 1
+    assert exc.value.sequence == 0
+
+
+def test_switch_plan_sub_nanosecond_offsets_and_adjacent_window_are_exact():
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    snap_a = m3u(1, media_sequence=0, durations=["10"],
+                 pdt_before={0: anchor}, uris=["a0.ts"])
+    snap_b = m3u(1, media_sequence=0, durations=["10"],
+                 pdt_before={0: "2024-01-01T00:00:00Z"}, uris=["b0.ts"])
+
+    # Adjacent legal window endpoints 1e-19 s apart must not be judged equal:
+    # the plan is one primary interval and both in-segment offsets keep the
+    # 19-digit fraction.
+    result = _render_plan(
+        _plan(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b],
+              start=anchor,
+              end="2024-01-01T00:00:00.0000000000000000002Z")
+    )
+    assert result == [
+        ("a", 0,
+         "2024-01-01T00:00:00.0000000000000000001Z",
+         "2024-01-01T00:00:00.0000000000000000002Z",
+         "0.0000000000000000000",
+         "0.0000000000000000001"),
+    ]
+
+    # A one-second window one whole second in keeps the exact fraction tail.
+    result = _render_plan(
+        _plan(URL_A, [snap_a, snap_a], URL_B, [snap_b, snap_b],
+              start="2024-01-01T00:00:01Z",
+              end="2024-01-01T00:00:02Z")
+    )
+    assert result == [
+        ("a", 0,
+         "2024-01-01T00:00:01Z",
+         "2024-01-01T00:00:02Z",
+         "0.9999999999999999999",
+         "1.9999999999999999999"),
+    ]
+
+
 def test_switch_plan_merge_error_tagged_with_stream():
     s10 = m3u(1, media_sequence=10, uris=["b10.ts"])
     s9 = m3u(1, media_sequence=9, uris=["b9.ts"])
@@ -1700,6 +1894,68 @@ def test_api_switch_plan_conflicts_are_422_tagged_with_stream():
     assert body["stream"] == "a"
     assert body["snapshot_index"] == 1
     assert body["sequence"] == 0
+
+
+def test_api_switch_plan_sub_nanosecond_anchor_conflict_is_422_without_plan():
+    # The two primary snapshots share sequence, URI and a 10-second duration;
+    # only the anchors differ by 1e-19 s. The backup is legal and the window
+    # is UTC second 1 to 2. Rounding to 28 significant digits used to equate
+    # the anchors, so the conflict was missed and a plan was returned.
+    def _snap(anchor, uri):
+        return (
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n"
+            f"#EXTINF:10,\n{uri}\n"
+        )
+
+    a0 = _snap("2024-01-01T00:00:00.0000000000000000001Z", "a0.ts")
+    a1 = _snap("2024-01-01T00:00:00.0000000000000000002Z", "a0.ts")
+    b0 = _snap("2024-01-01T00:00:00Z", "b0.ts")
+    resp = switch_post(
+        URL_A, [a0, a1], URL_B, [b0, b0],
+        start="2024-01-01T00:00:01Z",
+        end="2024-01-01T00:00:02Z",
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "program_time_conflict"
+    assert body["stream"] == "a"
+    assert body["snapshot_index"] == 1
+    assert body["sequence"] == 0
+    assert "intervals" not in body
+
+
+def test_api_switch_plan_keeps_sub_nanosecond_fractions_in_output():
+    def _snap(anchor, uri):
+        return (
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            f"#EXT-X-PROGRAM-DATE-TIME:{anchor}\n"
+            f"#EXTINF:10,\n{uri}\n"
+        )
+
+    anchor = "2024-01-01T00:00:00.0000000000000000001Z"
+    a0 = _snap(anchor, "a0.ts")
+    b0 = _snap("2024-01-01T00:00:00Z", "b0.ts")
+    # Endpoints 1e-19 s apart must not be treated as equal (start<end rule),
+    # and the response must echo the fraction with exact offsets.
+    resp = switch_post(
+        URL_A, [a0, a0], URL_B, [b0, b0],
+        start=anchor,
+        end="2024-01-01T00:00:00.0000000000000000002Z",
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "start_at": "2024-01-01T00:00:00.0000000000000000001Z",
+        "end_at": "2024-01-01T00:00:00.0000000000000000002Z",
+        "intervals": [
+            {"source": "a", "sequence": 0,
+             "uri": "https://a.example.com/live/a0.ts",
+             "start_at": "2024-01-01T00:00:00.0000000000000000001Z",
+             "end_at": "2024-01-01T00:00:00.0000000000000000002Z",
+             "offset_start": "0.0000000000000000000",
+             "offset_end": "0.0000000000000000001"},
+        ],
+    }
 
 
 def test_api_switch_plan_rejects_invalid_request_shapes():

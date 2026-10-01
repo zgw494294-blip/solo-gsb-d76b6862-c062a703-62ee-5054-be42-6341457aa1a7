@@ -37,6 +37,7 @@ from .intersect import (
 )
 from .locate import format_program_time
 from .reconcile import ReconcileError
+from .timeutil import exact_sub
 
 PRIMARY = "a"
 BACKUP = "b"
@@ -142,8 +143,8 @@ def _cover_gap(
                 uri=seg.uri,
                 start_at=start,
                 end_at=end,
-                offset_start=start - seg.start_at,
-                offset_end=end - seg.start_at,
+                offset_start=exact_sub(start, seg.start_at),
+                offset_end=exact_sub(end, seg.start_at),
             )
         )
         cursor = end
@@ -211,8 +212,8 @@ def build_switch_plan(
                 uri=seg.uri,
                 start_at=start,
                 end_at=end,
-                offset_start=start - seg.start_at,
-                offset_end=end - seg.start_at,
+                offset_start=exact_sub(start, seg.start_at),
+                offset_end=exact_sub(end, seg.start_at),
             )
         )
         # Pieces are positive-length, sorted and (self-overlap having been

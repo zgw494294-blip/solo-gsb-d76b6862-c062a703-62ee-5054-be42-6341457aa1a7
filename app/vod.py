@@ -19,6 +19,7 @@ from .reconcile import (
     reconcile,
     reject_forbidden_tags,
 )
+from .timeutil import exact_sub
 
 
 @dataclass(frozen=True)
@@ -138,8 +139,8 @@ def export_vod(
         to_sec=to_sec,
         covered_start=first.start,
         covered_end=last.end,
-        head_extra=from_sec - first.start,
-        tail_extra=last.end - to_sec,
+        head_extra=exact_sub(from_sec, first.start),
+        tail_extra=exact_sub(last.end, to_sec),
         segment_count=len(selected),
         playlist=render_vod_playlist(selected),
     )

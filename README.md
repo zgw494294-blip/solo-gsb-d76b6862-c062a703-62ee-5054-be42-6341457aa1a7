@@ -176,7 +176,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    归属到合并时间线上**实际包含该序号的连续序号区间**（相邻片段断点计数不变即为
    同一区间），而**不是按断点计数值查表**。
 2. **归一为 UTC**：标签和 `target_at` 的时区偏移先归一到 UTC。内部一律用
-   `Decimal` 精确十进制 POSIX 秒表示，小数秒按原样保留精度，全程不经过二进制浮点。
+   `Decimal` 精确十进制 POSIX 秒表示，小数秒按原样保留精度（位数不设上限，
+   每次加减都按操作数位数临时设定精度，不受默认 28 位有效数字限制），全程
+   不经过二进制浮点。
 3. **仅在同一连续序号区间内推算**：从锚点出发，按各片段 `EXTINF` 的精确十进制
    时长，向序号增大/减小两个方向逐段累加/累减，得到区间内每段的 UTC 起止时间。
    **绝不跨越 `#EXT-X-DISCONTINUITY` 断点推算**：无锚点的区间没有任何已知时间覆盖。
@@ -458,6 +460,49 @@ curl -s http://localhost:8000/v1/switch-plan \
   }'
 ```
 
+### 小数秒精度（贯穿 UTC 解析、推时、裁剪与片内偏移）
+
+内部时间一律为 `Decimal`，且**每次**加/减都在按操作数位数临时确定精度的
+上下文中执行（见 `app/timeutil.py`），不依赖默认的 28 位有效数字、也不使用
+二进制浮点。因此现代 POSIX 秒（10 位整数秒，如 `1704067200`）叠加任意位数的
+小数秒都不会被舍入：支持的小数位不设上限。相邻的合法起止时刻即使仅相差
+`1e-19` 秒也不会被判为相等；两份快照同序号的锚点只要归一 UTC 后存在任意
+小数位差异，即返回 `program_time_conflict`（带 `stream`、`snapshot_index`、
+`sequence`），不返回计划。
+
+复现：主路两份快照同序号、同 URI、同 10 秒时长，仅锚点相差 `1e-19` 秒；备路
+合法，请求时段为 2024-01-01 UTC 第 1～2 秒——必须返回 422 冲突而不是计划：
+
+```bash
+curl -s -i http://localhost:8000/v1/switch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "a": {
+      "playlist_url": "https://a.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.0000000000000000001Z\n#EXTINF:10,\na0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00.0000000000000000002Z\n#EXTINF:10,\na0.ts\n"
+      ]
+    },
+    "b": {
+      "playlist_url": "https://b.example.com/live/index.m3u8",
+      "snapshots": [
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n",
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-01T00:00:00Z\n#EXTINF:10,\nb0.ts\n"
+      ]
+    },
+    "start_at": "2024-01-01T00:00:01Z",
+    "end_at": "2024-01-01T00:00:02Z"
+  }'
+# HTTP/1.1 422 Unprocessable Entity
+# {"error":"program_time_conflict", ..., "stream":"a",
+#  "snapshot_index":1, "sequence":0}
+```
+
+把第二份主路快照的锚点改成与第一份逐位一致（`...0001Z`）即返回 200 计划；
+请求时段取仅相差 `1e-19` 秒的相邻起止时刻也会被接受，并在 `start_at` /
+`end_at` / `offset_start` / `offset_end` 中原样保留 19 位小数。
+
 ## `POST /v1/vod`：导出指定时段的 VOD 媒体清单
 
 请求体在 `playlist_url` 与 `snapshots` 之外，接收十进制秒区间
@@ -636,6 +681,7 @@ curl -s http://localhost:8000/v1/reconcile \
 ```
 app/
   hls.py         # 离线清单解析（序号 / 时长 / 断点 / 字节范围 / URI / PDT 锚点）
+  timeutil.py    # 精确十进制加/减：按操作数位数临时设定精度，时间链路全程不舍入
   reconcile.py   # 跨快照合并、连续性与一致性校验、时间轴计算、禁用标签检查
   locate.py      # PDT 精确 UTC 解析/推算、锚点一致性校验、半开区间定位
   intersect.py   # 两路已知节目时间片段的半开交集、自身重叠致歧义校验
